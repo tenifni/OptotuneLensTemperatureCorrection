@@ -16,16 +16,12 @@ byte ResReg = 0x08;  //Resolution register address
 // Reads from STTS2004 temp sensor register
 int getTemp() {
   unsigned char tempData[2];
-  // Get 16-bit temperature from Temp register
+ 
   Wire.beginTransmission(TempSensorI2CAddress);
   Wire.write(TempReg);
   Wire.endTransmission();
-  Wire.requestFrom(TempSensorI2CAddress, 2); //requests 2 bytes of data
+  Wire.requestFrom(TempSensorI2CAddress, 2); 
   tempData[0] = Wire.read(); //MSB
-  tempData[1] = Wire.read(); //LSB
-  // Converts data to 16-bit. bitRead() starts from rightmost (LSB). //first 4 bits of temp data are flag bits so we don't use them.
-  //float temperature = bitRead(tempData[0], 0) * 16 + bitRead(tempData[0], 1) * 32 + bitRead(tempData[0], 2) * 64 +  bitRead(tempData[0], 3) * 128 + bitRead(tempData[0], 4) * (-1);
-  //temperature = temperature + bitRead(tempData[1], 0)*0.0625 + bitRead(tempData[1], 1) * 0.125 + bitRead(tempData[1], 2)*0.25  + bitRead(tempData[1], 3)*0.5 + bitRead(tempData[1], 4)*1 + bitRead(tempData[1], 5)*2 + bitRead(tempData[1], 6)*4 + bitRead(tempData[1], 7)*8;
   unsigned int temp=tempData[1];
   temp+=((unsigned int)(tempData[0]&0x1F))<<8;
   float temperature=temp*0.0625;
@@ -179,16 +175,19 @@ void SPI_setup(){
 }
 
 // Transmits voltage data to DAC regsiter 
-byte writeToDAC(int data) {
+int writeToDAC(float dI) {
+    float scaled_I = dI/maxCurrent;
+    unsigned int Din = (scaled_I)* 65535/Vref;
     byte byte1 = (Din >> 8);
     byte byte2 = (Din & 0xFF);
     byte byte0 = 0;
-    
+//    Serial.println(scaled_I, DEC);
     digitalWrite(SS,LOW);//DAC starts reading on falling edge
-    SPI.transfer(SS, byte0);
-    SPI.transfer(SS, byte1);
-    SPI.transfer(SS, byte2);
+    SPI.transfer(byte0);
+    SPI.transfer(byte1);
+    SPI.transfer(byte2);
     digitalWrite(SS,HIGH);//DAC stops reading on falling edge
+    return Din;
 }
 
 
@@ -210,6 +209,21 @@ void setup() {
 void loop() {
   int temp = getTemp();// Gets temperature from sensor
   int dI = abs(getIset(temp, DptSet)- I); // Calculates correction current
-  Din = (dI * 262.14) * Vref; // converts to DAC voltage
-  writeToDAC(Din); // Outputs to DAC
+  Din = writeToDAC(150); // converts and outputs DAC voltage
+
+  Serial.println("===================================");
+  Serial.print("Converted Temperature (degC)   ");
+  Serial.println(temp);
+
+  Serial.print("Current setpoint is ");
+  Serial.println(I);
+  Serial.print("Correction Current: ");
+  Serial.println(dI, DEC);
+  Serial.print("Output voltage: ");
+  Serial.println(Din*5./65535, DEC);
+  Serial.print("Mapped Voltage (mV): ");
+  Serial.println(Din, DEC);
+
+  delay(2000);
+  
 }
