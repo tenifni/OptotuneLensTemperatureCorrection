@@ -1,41 +1,190 @@
-/*
-  DAC output voltage according to compensation current
-  May 6 2021
-  ======================= AD5060 DAC =================
-  The DAC is 16-bit, so the oputput voltage has range 0-65535V (2^16 posisble values). The DAC is supplied with a 5V reference voltage  with from REF5050.
-  Vout =  Vin* Vref/65535
-  Mapping (-250,250)mA to 65536 is 262.14 scale factor
-  Temperature data format: 16-bit (2 bytes) with BIT 12-2 = Tmperature (default 10bit). But solution can go to 0.0625.
-  |  BIT 15  | ... |BIT 0 |
-  |   MSB    | ... | LSB  |  D
-  Eg.  mapped voltage 36811 (= 2^15+2^11+2^10+2^9+2^8 +2^7+2^6+2^3+2+1) = 10001111 11001011
+/*May 7 2021
+  getLenTemp(): Reads in temperature from Optotune 10-30 tunable lens
+  calculates correction current
+  toDAC(): converts correction current to DAC input voltage 
 */
 
+#include <Wire.h>
+#include <math.h>
 #include <SPI.h>
 
+//Sets up to read temperature via I2C from STTS2004 slave 
+byte TempSensorI2CAddress = 0x18; //stts004 temperature register address
+byte TempReg = 0x05; // Temperature register address
+byte ResReg = 0x08;  //Resolution register address
+
+// Reads from STTS2004 temp sensor register
+int getTemp() {
+  unsigned char tempData[2];
+ 
+  Wire.beginTransmission(TempSensorI2CAddress);
+  Wire.write(TempReg);
+  Wire.endTransmission();
+  Wire.requestFrom(TempSensorI2CAddress, 2); 
+  tempData[0] = Wire.read(); //MSB
+  unsigned int temp=tempData[1];
+  temp+=((unsigned int)(tempData[0]&0x1F))<<8;
+  float temperature=temp*0.0625;
+  return temperature;
+//  //Show on serial monitor
+//  Serial.print("16-bit  Temperature = ");
+//  Serial.print(tempData[0]);
+//  Serial.print(tempData[1]);
+//  Serial.println();
+//  Serial.print("Converted Temperature (degC)   ");
+//  Serial.println(temperature);
+//  delay(1000);
+}
+
+// Calibration data for performing linear interpolation
+int current[16] = {-210,  -180,  -150,  -120,   -90,   -60 ,  -30, 0,    30,    60,    90,   120,   150,   180,   210,   240};
+float Curve30[16]= {-11.0583,
+   -9.8197,
+   -8.4629,
+   -6.9553,
+   -5.2996,
+   -3.4974,
+   -1.5789,
+    0.4126,
+    2.3057,
+    4.0869,
+    5.7214,
+    7.2111,
+    8.5663,
+    9.8051,
+   10.9482,
+   12.0202};
+   
+float Curve45[16] = {-10.3719,
+   -9.1155,
+   -7.7484,
+   -6.2424,
+   -4.5981,
+   -2.8394,
+   -0.9859,
+    0.9529,
+    2.7769,
+    4.5248,
+    6.1419,
+    7.6319,
+    8.9982,
+   10.2451,
+   11.4061,
+   12.4819,
+};
+
+
+int n = sizeof(current)/sizeof(current[0]);// len of current array
+int firstIdx = 0, lastIdx = n-1;
+int maxCurrent = 250, minCurrent = -210;
+int temp1 = 30, temp2 = 45;
+float Curve[16] = {0};
+
+// Binary search function
+int rangeSearch(float a[], float key, int left,int right){
+  
+  while (left <= right){
+    int middle =  left + (right - left)/2;
+    if (key > a[middle]){
+      left = middle + 1;
+    }else if (key < a[middle]){
+      right = middle -1;
+    }else{
+      return middle;
+    }
+  }
+  return (left-1);
+}
+
+// Calculates current setpoint given temp and diopter setpoint
+int getIset(float temp, float FPset)
+{
+    int Iset;
+  // Checks temperature range, then calculates current setpoint at this temperature, given FP setpiont using linear interpolation 
+  if (temp == temp1) {
+    //binary search for which range the DptSetpoint is in
+    int l = rangeSearch(Curve30, FPset, 0, n-1);
+    int r = l +1;
+    // linear interploates for the current setpoint in that range
+   Iset =abs((current[r]-current[l])*(FPset - Curve30[l]))/(Curve30[r]- Curve30[l]) + current[l];// x = (y-y1)/slope+x1
+  } else if (temp == temp2){
+    int l = rangeSearch(Curve45, FPset, 0, n-1);
+    int r = l +1;
+    Iset = abs((current[r]-current[l])*((FPset - Curve45[l])))/(Curve45[r]- Curve45[l]) + current[l];
+
+  } else if (temp < temp1){
+    //interpolates to get whole curve at this temp
+    for (int i = 0 ; i <=n; i++){
+      Curve[i] = Curve30[i] - ((temp1-temp)/abs(temp2-temp1))*(Curve45[i] - Curve30[i]);
+    }
+    //search for range of the FP setpoint
+    int l = rangeSearch(Curve, FPset, 0, n-1);
+    int r = l +1;
+    //interpolate again to get current
+    Iset = abs((current[r]-current[l])*((FPset - Curve[l])))/(Curve[r]- Curve[l]) + current[l];
+  } else if (temp > temp2){
+    //interpolates to get whole curve at this temp
+    for (int i = 0 ; i <=n; i++){
+      Curve[i] = Curve45[i] + ((temp-temp2)/abs(temp2-temp1))*(Curve45[i]-Curve30[i]);
+    }
+    int l = rangeSearch(Curve, FPset, 0, n-1);
+    int r = l +1;
+    //interpolate again to get current
+    Iset = abs((current[r]-current[l])*((FPset - Curve[l])))/(Curve[r]- Curve[l]) + current[l];
+
+
+  } else{ //in between two temperatures
+    int l1 = rangeSearch(Curve30, FPset, 0, n-1); int r1 = l1+1;
+    int l2 = rangeSearch(Curve45, FPset, 0, n-1);  int r2 = l2+1;
+    int l = min(min(l1,r1), min(l2, r2));
+    int r = max(max(l1,r1),max(l2,r2));
+   
+    for (int i = l; i<=r; i++){
+      Curve[i] = Curve30[i] + (temp/abs(temp2-temp1))*(Curve45[i] - Curve30[i]);
+    }
+    int ll =  rangeSearch(Curve, FPset, l, r)+1;
+    int rr = ll+1;
+    //interpolate again to get current
+    Iset = abs((current[rr]-current[ll])*(FPset - Curve[ll]))/((Curve[rr]- Curve[ll])) + current[ll];
+  }
+  
+  if(Iset>maxCurrent){
+      Iset =maxCurrent;
+      return Iset;
+  }else if(Iset < minCurrent){
+      return Iset;
+  }else{
+      return Iset;
+  }
+}
+
+
+// Setup for outputting DAC voltage via SPI protocol
 #define DI 11//MOSI
 #define SCK 13 //SPI clock
 #define SS 8// Slave select
 
-int dI = 150;
-float myVolt = dI/250;
+
 int Vref = 5;
+
 
 void SPI_setup(){
   pinMode(SS, OUTPUT);
-//  pinMode(DI, OUTPUT);
-//  pinMode(SCK, OUTPUT);
+  pinMode(DI, OUTPUT);
+  pinMode(SCK, OUTPUT);
   SPI.begin();
   SPI.setDataMode(SPI_MODE1);
   digitalWrite(SS,HIGH);
 }
-void writeToDAC() {
+
+// Transmits voltage data to DAC regsiter 
+int writeToDAC(int dI) {
+    float myVolt = dI/250;
     unsigned int Din = (myVolt+Vref)*65535./10;
     byte byte1 = (Din >> 8);
     byte byte2 = (Din & 0xFF);
     byte byte0 = 0;
-    
-
+//    Serial.println(scaled_I, DEC);
     digitalWrite(SS,LOW);//DAC starts reading on falling edge
     SPI.transfer(byte0);
     SPI.transfer(byte1);
@@ -45,22 +194,43 @@ void writeToDAC() {
     Serial.print("Binary: ");
     Serial.println(byte1, BIN);
     Serial.println(byte2, BIN);
-
-    Serial.print("Correction Current: ");
-    Serial.println(dI, DEC);
-    Serial.print("Output voltage: ");
-    Serial.println(Din);
-//    Serial.print("Mapped Voltage (V): ");
-//    Serial.println(Din*10/65535 -Vref, DEC);
+    return Din;
 }
+
+
+
+float DptSet = 5.7;
+int I = 100;
 void setup() {
   Serial.begin(9600);
+  Wire.begin();
+  // Sets resolution of temperature value to 16-bit.
+  Wire.beginTransmission(TempSensorI2CAddress);
+  Wire.write(ResReg); // selects resolution register
+  Wire.write(0x03); //resolution 0.0625C
+  Wire.endTransmission();
   SPI_setup();
-   
+
 }
+
 void loop() {
-  
-  writeToDAC();
+  int temp = getTemp();// Gets temperature from sensor
+  int dI = abs(getIset(temp, DptSet)- I); // Calculates correction current
+  float Din = writeToDAC(150); // converts and outputs DAC voltage
+
+  Serial.println("===================================");
+  Serial.print("Converted Temperature (degC)   ");
+  Serial.println(temp);
+
+  Serial.print("Current setpoint is ");
+  Serial.println(I);
+  Serial.print("Correction Current: ");
+  Serial.println(dI, DEC);
+  Serial.print("Output Scaled voltage: ");
+  Serial.println(Din, DEC);
+//  Serial.print("Mapped Voltage (mV): ");
+//  Serial.println(Din*10/65535 - Vref, DEC);
 
   delay(3000);
+  
 }
